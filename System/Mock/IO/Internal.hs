@@ -1,12 +1,14 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, OverloadedStrings, ExistentialQuantification, RecordWildCards, PackageImports, NoImplicitPrelude #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, OverloadedStrings, ExistentialQuantification, RecordWildCards, 
+PackageImports, NoImplicitPrelude, DeriveDataTypeable, TupleSections #-}
 module System.Mock.IO.Internal (
-    IO, Handle, IOMode, SeekMode, FilePath, HandlePosn, User, Server, Direction (In, Out),
+    IO, MVar, Handle, IOMode, SeekMode, FilePath, HandlePosn, User, Server, Direction (In, Out),
     RealWorld (RealWorld, handles, files, workDir, isPermitted, nextHandle),
     newWorld, emptyWorld, mkUser, setUser, mkServer, addServer, removeServer, listServers, runIO, evalIO, stdin, stdout, stderr,
+    newMVar, newEmptyMVar, isEmptyMVar, tryTakeMVar, takeMVar, tryPutMVar, tryReadMVar, readMVar, putMVar, swapMVar, modifyMVar, modifyMVar_,
     withFile, openFile, hClose, readFile, writeFile, appendFile, doesFileExist,
     connectTo,
     hFileSize, hSetFileSize, hIsEOF, isEOF, hGetBuffering, hSetBuffering, hFlush,
-    hGetPosn, hSetPosn, hSeek, hTell,
+    hGetPosn, hSetPosn, hSeek, hTell, hReady, hAvailable, 
     hIsOpen, hIsClosed, hIsReadable, hIsWritable, hIsSeekable, hIsTerminalDevice, hShow,
     hGetChar, hGetLine, hLookAhead, hGetContents, 
     hPutChar, hPutStr, hPutStrLn, hPrint,
@@ -18,6 +20,7 @@ module System.Mock.IO.Internal (
 import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, 
                               readFile, writeFile, appendFile, getContents, interact)
 import qualified "network" Network as N
+import Data.Typeable
 
 import Control.Applicative
 import Control.Monad
@@ -128,6 +131,9 @@ mkUser = User
 mkServer :: u -> (Handle -> u -> IO u) -> Server
 mkServer = Server
 
+data MVar a = MVar Integer deriving (Eq, Ord, Typeable)
+data MValue = MEmpty | forall a. Typeable a => MValue a deriving (Typeable)
+
 data RealWorld = forall u. RealWorld {
   workDir :: FilePath,
   files :: Map File Text,
@@ -135,8 +141,75 @@ data RealWorld = forall u. RealWorld {
   handles :: Map Handle HandleData,
   nextHandle :: Integer,
   user :: User,
-  servers :: Map String Server
+  servers :: Map String Server,
+  mvars :: Map Integer MValue,
+  nextMVar :: Integer
 }
+
+newEmptyMVar :: Typeable a => IO (MVar a)
+newEmptyMVar =
+  do w <- getWorld
+     let id = nextMVar w
+     putWorld (w {nextMVar = id + 1, mvars = M.insert id MEmpty (mvars w)})
+     return (MVar id)
+
+newMVar :: Typeable a => a -> IO (MVar a)
+newMVar y =
+  do w <- getWorld
+     let id = nextMVar w
+     putWorld (w {nextMVar = id + 1, mvars = M.insert id (MValue y) (mvars w)})
+     return (MVar id)
+
+tryTakeMVar :: Typeable a => MVar a -> IO (Maybe a)
+tryTakeMVar (MVar x) = 
+  do y <- fmap (M.lookup x . mvars) getWorld
+     case y of
+       Nothing -> fail ("Invalid MVar: " ++ show x)
+       Just MEmpty -> return Nothing
+       Just (MValue y) -> case cast y of
+                            Nothing -> fail ("Invalid MVar: " ++ show x)
+                            Just y  -> return (Just y)
+
+takeMVar :: Typeable a => MVar a -> IO a
+takeMVar (MVar x) = tryTakeMVar (MVar x) >>= maybe (fail ("Empty MVar: " ++ show x)) return
+
+isEmptyMVar :: Typeable a => MVar a -> IO Bool
+isEmptyMVar x = fmap (maybe True (const False)) (tryTakeMVar x)
+
+tryReadMVar :: Typeable a => MVar a -> IO a
+tryReadMVar = readMVar
+
+readMVar :: Typeable a => MVar a -> IO a
+readMVar = takeMVar
+
+swapMVar :: Typeable a => MVar a -> a -> IO a
+swapMVar x y = modifyMVar x (\y' -> return (y,y'))
+
+modifyMVar :: Typeable a => MVar a -> (a -> IO (a, b)) -> IO b
+modifyMVar (MVar x) f =
+  do w <- getWorld
+     case M.lookup x (mvars w) of
+       Nothing -> fail ("Empty MVar: " ++ show x)
+       Just MEmpty -> fail ("Invalid MVar: " ++ show x)
+       Just (MValue y) -> case cast y of
+                             Nothing -> fail ("Empty MVar: " ++ show x)
+                             Just y -> do (z,r) <- f y
+                                          putWorld (w {mvars = M.insert x (MValue z) (mvars w)})
+                                          return r
+
+modifyMVar_ :: Typeable a => MVar a -> (a -> IO a) -> IO ()
+modifyMVar_ x f = modifyMVar x (fmap (, ()) . f)
+
+tryPutMVar :: Typeable a => MVar a -> a -> IO Bool
+tryPutMVar (MVar x) y =
+  do w <- getWorld
+     putWorld (w {mvars = M.insert x (MValue y) (mvars w)})
+     return True
+
+putMVar :: Typeable a => MVar a -> a -> IO ()
+putMVar x y = tryPutMVar x y >> return ()
+
+
 
 setUser :: User -> RealWorld -> RealWorld
 setUser usr w = w {user = usr}
@@ -208,7 +281,7 @@ newWorld workDir files permitted
                            (usrStdin, HandleData WriteMode True False LineBuffering 0),
                            (usrStdout, HandleData ReadMode True False LineBuffering 0),
                            (usrStderr, HandleData ReadMode True False LineBuffering 0)])
-              0 (mkUser () (const (return ()))) (M.empty)
+              0 (mkUser () (const (return ()))) M.empty M.empty 0
 
 emptyWorld :: RealWorld
 emptyWorld = newWorld "/" [] (\_ _ -> True)
@@ -410,6 +483,21 @@ hIsEOF h =
      hEnsureOpen' "hIsEOF" h d
      t <- getFileContents "hIsEOF" (_hInFile h)
      return (_hBufPos d >= fromIntegral (T.length t))
+
+hReady :: Handle -> IO Bool
+hReady h = 
+  do d <- getHData "hWaitForInput" h
+     hEnsureOpen' "hWaitForInput" h d
+     hEnsureReadable "hWaitForInput" h d
+     fmap not (hIsEOF h)
+
+hAvailable :: Handle -> IO Integer
+hAvailable h =
+  do d <- getHData "hAvailable" h
+     hEnsureOpen' "hAvailable" h d
+     hEnsureReadable "hAvailable" h d
+     t <- getFileContents "hAvailable" (_hInFile h)
+     return (max 0 (fromIntegral (T.length t) - _hBufPos d))
 
 isEOF :: IO Bool
 isEOF = hIsEOF stdin
