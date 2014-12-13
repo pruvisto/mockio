@@ -1,36 +1,52 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, OverloadedStrings, ExistentialQuantification, RecordWildCards, 
-PackageImports, NoImplicitPrelude, DeriveDataTypeable, TupleSections #-}
+{-# LANGUAGE Unsafe #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE PackageImports #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE StandaloneDeriving #-}
 module System.Mock.IO.Internal (
-    IO, MVar, Handle, IOMode, SeekMode, FilePath, HandlePosn, User, Server, Direction (In, Out),
+    IO, MVar, Handle, IOMode (..), SeekMode (..), FilePath, HandlePosn (..), Direction (In, Out), SpecialFile (..),
     RealWorld (RealWorld, handles, files, workDir, isPermitted, nextHandle),
-    newWorld, emptyWorld, mkUser, setUser, mkServer, addServer, removeServer, listServers, runIO, evalIO, stdin, stdout, stderr,
+    newWorld, emptyWorld, setUser, addServer, removeServer, listServers, runIO, evalIO, stdin, stdout, stderr,
     newMVar, newEmptyMVar, isEmptyMVar, tryTakeMVar, takeMVar, tryPutMVar, tryReadMVar, readMVar, putMVar, swapMVar, modifyMVar, modifyMVar_,
     withFile, openFile, hClose, readFile, writeFile, appendFile, doesFileExist,
-    connectTo,
+    connectTo, withSocketsDo,
     hFileSize, hSetFileSize, hIsEOF, isEOF, hGetBuffering, hSetBuffering, hFlush,
-    hGetPosn, hSetPosn, hSeek, hTell, hReady, hAvailable, 
+    hGetPosn, hSetPosn, hSeek, hTell, hReady, hAvailable, hWaitForInput,
     hIsOpen, hIsClosed, hIsReadable, hIsWritable, hIsSeekable, hIsTerminalDevice, hShow,
     hGetChar, hGetLine, hLookAhead, hGetContents, 
     hPutChar, hPutStr, hPutStrLn, hPrint,
     putChar, putStr, putStrLn, print,
     getChar, getLine, getContents, readIO, readLn, interact,
-    dumpHandle, usrStdin, usrStdout, usrStderr, reverseHandle, getOpenHandles
+    dumpHandle, getOpenHandles, wait,
+    registerWriteHook, hookConsole, readConsoleHook, showConsoleHook, hookHandle, readHandleHook, showHandleHook
   ) where
 
-import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, 
+import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, print,
                               readFile, writeFile, appendFile, getContents, interact)
 import qualified "network" Network as N
-import Data.Typeable
 
 import Control.Applicative
 import Control.Monad
+import Control.Monad.Cont
 import Control.Monad.State.Strict
+import Control.Monad.Pause
+
+import Data.Function
 import qualified Data.Text.Lazy as T
 import Data.Text.Lazy (Text)
 import qualified Data.Map.Strict as M
 import Data.Map.Strict (Map)
+import Data.Maybe
+import Data.Ord
 import Data.List.Split
-import Data.List (intercalate, genericIndex)
+import Data.List
+import Data.Typeable
+import Debug.Trace
 
 type FilePath = String
 type PortID = N.PortID
@@ -63,8 +79,8 @@ normalizePath p
         | a /= ".." = normRel ps as
     normRel (p : ps) as = normRel ps (p : as)
 
-data IOMode = ReadMode | WriteMode | AppendMode | ReadWriteMode deriving (Show, Eq, Ord, Read, Enum)
-data SeekMode = AbsoluteSeek | RelativeSeek | SeekFromEnd deriving (Show, Eq, Ord, Read, Enum)
+data IOMode = ReadMode | WriteMode | AppendMode | ReadWriteMode deriving (Show, Eq, Ord, Read, Enum, Typeable)
+data SeekMode = AbsoluteSeek | RelativeSeek | SeekFromEnd deriving (Show, Eq, Ord, Read, Enum, Typeable)
 
 allowsReading :: IOMode -> Bool
 allowsReading m = m == ReadMode || m == ReadWriteMode
@@ -73,48 +89,48 @@ allowsWriting :: IOMode -> Bool
 allowsWriting m = m /= ReadMode
 
 
-data SpecialFile = StdIn | StdOut | StdErr deriving (Eq, Ord)
+data SpecialFile = StdIn | StdOut | StdErr deriving (Eq, Ord, Typeable)
 
 instance Show SpecialFile where
   show StdIn = "<stdin>"
   show StdOut = "<stdout>"
   show StdErr = "<stderr>"
 
-data Direction = In | Out deriving (Eq, Ord, Show)
-data File = RegularFile FilePath | NetworkSocket Integer String Direction | SpecialFile SpecialFile deriving (Eq, Ord)
+data Direction = In | Out deriving (Eq, Ord, Show, Typeable)
+data File = RegularFile FilePath | NetworkSocket Integer String Direction | SpecialFile SpecialFile deriving (Eq, Ord, Typeable)
 
 instance Show File where
   show (RegularFile p) = p
   show (SpecialFile t) = show t
   show (NetworkSocket _ s _) = s
 
+data Connection = Connection { connectionHost :: String, connectionPort :: PortID,
+                               clientHandle :: Handle, serverHandle :: Handle, connectionServer :: ServerInstance }
 
-
-data Handle = Handle {_hId :: Integer, _hName :: String, _hInFile :: File, _hOutFile :: File,
-                      _hReverseHandle :: Maybe Handle}
+data Handle = Handle {_hId :: Integer, _hName :: String, _hInFile :: File, _hOutFile :: File} deriving (Typeable)
 
 instance Eq Handle where
-  h1 == h2 = _hId h1 == _hId h2
+  (==) = (==) `on` _hId
 
 instance Ord Handle where
-  compare h1 h2 = compare (_hId h1) (_hId h2)
+  compare = comparing _hId
 
 instance Show Handle where
-  show = show . _hName
+  show = _hName
 
-data BufferMode = NoBuffering | LineBuffering | BlockBuffering (Maybe Int) deriving (Eq, Ord, Read, Show)
+data BufferMode = NoBuffering | LineBuffering | BlockBuffering (Maybe Int) deriving (Eq, Ord, Read, Show, Typeable)
 
 data HandleData = HandleData {
   _hGetMode :: IOMode,
   _hIsOpen :: Bool,
   _hIsSeekable :: Bool,
   _hBufferMode :: BufferMode,
-  _hBufPos :: Integer
-}
+  _hInBufPos :: Integer,
+  _hOutBufPos :: Integer
+} deriving (Typeable)
 
 _hIsFile :: Handle -> Bool
-_hIsFile (Handle _ _(RegularFile _) _ _) = True
-_hIsFile _ = False
+_hIsFile h = case _hInFile h of {RegularFile _ -> True; _ -> False}
 
 seekError :: String -> Handle -> a
 seekError s h = error (show h ++ ": " ++ s ++ ": illegal operation (handle is not seekable)")
@@ -122,17 +138,14 @@ seekError s h = error (show h ++ ": " ++ s ++ ": illegal operation (handle is no
 invalidArgError :: String -> Handle -> a
 invalidArgError s h = error (show h ++ ": " ++ s ++ ": illegal operation (Invalid argument)")
 
-data User = forall u. User u (u -> IO u)
-data Server = forall s. Server s (Handle -> s -> IO s)
-
-mkUser :: u -> (u -> IO u) -> User
-mkUser = User
-
-mkServer :: u -> (Handle -> u -> IO u) -> Server
-mkServer = Server
+type User = IO ()
+type Server = Handle -> ServerInstance
+type ServerInstance = IO ()
 
 data MVar a = MVar Integer deriving (Eq, Ord, Typeable)
 data MValue = MEmpty | forall a. Typeable a => MValue a deriving (Typeable)
+
+newtype IO a = IO { unwrapIO :: PauseT (State RealWorld) a } deriving (Functor, Applicative, Monad)
 
 data RealWorld = forall u. RealWorld {
   workDir :: FilePath,
@@ -142,9 +155,47 @@ data RealWorld = forall u. RealWorld {
   nextHandle :: Integer,
   user :: User,
   servers :: Map String Server,
+  connections :: Map Handle Connection,
   mvars :: Map Integer MValue,
-  nextMVar :: Integer
+  nextMVar :: Integer,
+  writeHooks :: [Handle -> Text -> IO ()]
 }
+
+getWorld :: IO RealWorld
+getWorld = IO (lift get)
+
+getFromWorld :: (RealWorld -> a) -> IO a
+getFromWorld f = IO (lift (gets f))
+
+putWorld :: RealWorld -> IO ()
+putWorld w = IO (lift (put w))
+
+updateWorld :: (RealWorld -> RealWorld) -> IO ()
+updateWorld f = IO (lift (modify f))
+
+putConnectionServer :: Handle -> ServerInstance -> IO ()
+putConnectionServer h s = updateWorld (\w -> w {connections = f (connections w)})
+  where f = M.adjust (\c -> c {connectionServer = s}) h
+
+-- Give control back to the caller
+wait :: IO ()
+wait = IO yield
+
+nop :: IO ()
+nop = return ()
+
+-- Runs an IO action until wait is called, storing the remaining action in the world using the given operation
+runIOUntilSuspend :: IO () -> (IO () -> IO ()) -> IO ()
+runIOUntilSuspend (IO c) wr = IO (lift (stepPause c)) >>= either (wr . IO) (const (wr nop))
+
+evalIO :: IO a -> RealWorld -> a
+evalIO io w = fst (runIO io w)
+
+runIO :: IO a -> RealWorld -> (a, RealWorld)
+runIO (IO io) w = runState (runPause io) w
+
+
+{- Mutable variables -}
 
 newEmptyMVar :: Typeable a => IO (MVar a)
 newEmptyMVar =
@@ -210,78 +261,90 @@ putMVar :: Typeable a => MVar a -> a -> IO ()
 putMVar x y = tryPutMVar x y >> return ()
 
 
+{- Write Hooks -}
+
+registerWriteHook :: (Handle -> Text -> IO ()) -> IO ()
+registerWriteHook h = updateWorld (\w -> w {writeHooks = h : writeHooks w})
+
+{- The User -}
 
 setUser :: User -> RealWorld -> RealWorld
-setUser usr w = w {user = usr}
+setUser u w = w {user = u}
+
+putUser :: User -> IO ()
+putUser u = updateWorld (\w -> w {user = u})
+
+defaultUser :: User
+defaultUser = nop
+
+reverseSpecialHandles :: IO ()
+reverseSpecialHandles = updateWorld (\w -> w { handles = let hs = handles w in M.union (M.fromList (f hs)) hs})
+  where f hs = zip specialHandles (map (fromJust . flip M.lookup hs) (drop 3 (cycle specialHandles)))
 
 runUser :: IO ()
-runUser =
-  do User userState userAction <- fmap user getWorld
-     userState' <- userAction userState
-     w <- getWorld
-     putWorld (setUser (User userState' userAction) w)
+runUser = 
+  do u <- getFromWorld user
+     reverseSpecialHandles
+     runIOUntilSuspend u putUser
+     reverseSpecialHandles
+
+
+{- Servers -}
 
 getServer :: String -> IO (Maybe Server)
 getServer s = fmap (M.lookup s . servers) getWorld
 
-addServer :: HostName -> PortID -> Server -> RealWorld -> RealWorld
+addServer :: HostName -> PortID -> (Handle -> IO ()) -> RealWorld -> RealWorld
 addServer host port server w = w {servers = M.insert (showConnectionInfo host port) server (servers w)}
 
 removeServer :: HostName -> PortID -> RealWorld -> RealWorld
 removeServer host port w = w {servers = M.delete (showConnectionInfo host port) (servers w)}
 
-putServer :: String -> Server -> IO ()
-putServer s server = getWorld >>= (\w -> putWorld (w {servers = M.insert s server (servers w)}))
-
 listServers :: IO [String]
 listServers = fmap (map fst . M.toList . servers) getWorld
 
-runServer :: String -> Handle -> IO ()
-runServer name h = 
-  do server <- getServer name
-     case server of
-        Nothing -> return ()
-        Just (Server serverState serverAction) ->
-          do serverState' <- serverAction h serverState
-             putServer name (Server serverState' serverAction) 
+getConnection :: Handle -> IO (Maybe Connection)
+getConnection h = getFromWorld (M.lookup h . connections)
 
-newtype IO a = IO { getIO :: State RealWorld a } deriving (Functor, Applicative, Monad)
+putConnection :: Connection -> IO ()
+putConnection c = updateWorld (\w -> w { connections = M.insert (clientHandle c) c (connections w) })
 
-getWorld :: IO RealWorld
-getWorld = IO get
+removeConnection :: Handle -> IO ()
+removeConnection h = updateWorld (\w -> w { connections = M.delete h (connections w) })
 
-putWorld :: RealWorld -> IO ()
-putWorld = IO . put
+runServer :: Connection -> IO ()
+runServer c = runIOUntilSuspend (connectionServer c) (putConnectionServer (clientHandle c))
 
-evalIO :: IO a -> RealWorld -> a
-evalIO (IO s) = fst . runState s
-
-runIO :: IO a -> RealWorld -> (a, RealWorld)
-runIO (IO s) = runState s
-
-mkSpecialHandle :: Integer -> SpecialFile -> Maybe Handle -> Handle
-mkSpecialHandle id t h = Handle id (show t) (SpecialFile t) (SpecialFile t) h
+mkSpecialHandle :: Integer -> SpecialFile -> Handle
+mkSpecialHandle id t = Handle id (show t) (SpecialFile t) (SpecialFile t)
 
 specialHandles@[stdin, stdout, stderr, usrStdin, usrStdout, usrStderr] = 
-    zipWith3 mkSpecialHandle [-1,-2..] [StdIn, StdOut, StdErr, StdIn, StdOut, StdErr] 
-             [Just usrStdin, Just usrStdout, Just usrStderr, Nothing, Nothing, Nothing]
+    zipWith mkSpecialHandle [-1,-2..] [StdIn, StdOut, StdErr, StdIn, StdOut, StdErr] 
 
 reverseSpecialHandle :: Integer -> Handle
 reverseSpecialHandle i = cycle specialHandles `genericIndex` (2 - i)
 
 newWorld :: FilePath -> [(FilePath, Text)] -> (FilePath -> IOMode -> Bool) -> RealWorld
-newWorld workDir files permitted
-  = RealWorld workDir
-              (M.fromList ([(SpecialFile t, "") | t <- [StdIn, StdOut, StdErr]] ++
-                           [(RegularFile path, content) | (path, content) <- files]))
-              permitted
-              (M.fromList [(stdin, HandleData ReadMode True False LineBuffering 0),
-                           (stdout, HandleData AppendMode True False LineBuffering 0),
-                           (stderr, HandleData AppendMode True False LineBuffering 0),
-                           (usrStdin, HandleData WriteMode True False LineBuffering 0),
-                           (usrStdout, HandleData ReadMode True False LineBuffering 0),
-                           (usrStderr, HandleData ReadMode True False LineBuffering 0)])
-              0 (mkUser () (const (return ()))) M.empty M.empty 0
+newWorld workDir files permitted =
+  RealWorld {
+    workDir = workDir,
+    files = M.fromList ([(SpecialFile t, "") | t <- [StdIn, StdOut, StdErr]] ++
+                           [(RegularFile path, content) | (path, content) <- files]),
+    isPermitted = permitted,
+    nextHandle = 0,
+    nextMVar = 0,
+    handles = M.fromList [(stdin, HandleData ReadMode True False LineBuffering 0 0),
+                           (stdout, HandleData AppendMode True False LineBuffering 0 0),
+                           (stderr, HandleData AppendMode True False LineBuffering 0 0),
+                           (usrStdin, HandleData WriteMode True False LineBuffering 0 0),
+                           (usrStdout, HandleData ReadMode True False LineBuffering 0 0),
+                           (usrStderr, HandleData ReadMode True False LineBuffering 0 0)],
+    mvars = M.empty,
+    servers = M.empty,
+    connections = M.empty,
+    user = defaultUser,
+    writeHooks = []
+  }
 
 emptyWorld :: RealWorld
 emptyWorld = newWorld "/" [] (\_ _ -> True)
@@ -314,8 +377,8 @@ hIsSeekable :: Handle -> IO Bool
 hIsSeekable h = fmap _hIsSeekable (getHData "hIsSeekable" h)
 
 hIsTerminalDevice :: Handle -> IO Bool
-hIsTerminalDevice (Handle _ _ (SpecialFile t) _ _) = return (t == StdIn || t == StdOut || t == StdErr)
-hIsTerminalDevice _ = return False
+hIsTerminalDevice h = case _hInFile h of SpecialFile t -> return (t == StdIn || t == StdOut || t == StdErr)
+                                         _ -> return False
 
 getFileContents :: String -> File -> IO Text
 getFileContents s f = 
@@ -372,15 +435,10 @@ mkHandle :: String -> (Integer -> File) -> (Integer -> File) -> IOMode -> Bool -
 mkHandle name inFile outFile mode seekable pos =
   do w <- getWorld
      let id = nextHandle w
-     let h = Handle id name (inFile id) (outFile id) Nothing
-     let d = HandleData mode True seekable LineBuffering pos
+     let h = Handle id name (inFile id) (outFile id)
+     let d = HandleData mode True seekable LineBuffering pos pos
      putWorld (w {nextHandle = id + 1, handles = M.insert h d (handles w)})
      return h
-
-reverseHandle :: Handle -> Handle
-reverseHandle h = case _hReverseHandle h of 
-                    Nothing -> error (show h ++ ": handle does not have a reverse handle")
-                    Just h' -> h'
 
 openFile :: FilePath -> IOMode -> IO Handle
 openFile path mode =
@@ -404,25 +462,29 @@ showConnectionInfo h (N.Service s) = s ++ "://" ++ h
 showConnectionInfo h (N.PortNumber n) = h ++ ":" ++ show n
 showConnectionInfo h (N.UnixSocket s) = s
 
+withSocketsDo :: IO a -> IO a
+withSocketsDo = id
+
 connectTo :: HostName -> PortID -> IO Handle
 connectTo host port =
   do let name = showConnectionInfo host port
      w <- getWorld
      server <- getServer name
      case server of
-       Nothing -> fail "getAddrInfo: does not exist (No address associated with hostname)"
-       Just _  -> 
+       Nothing -> fail "connect: does not exist (Connection refused)"
+       Just server  -> 
          do h <- mkHandle name (\id -> NetworkSocket id name In) (\id -> NetworkSocket id name Out) ReadWriteMode False 0
             h' <- mkHandle (name ++ " (server)") (const (_hOutFile h)) (const (_hInFile h)) ReadWriteMode False 0
             putFileContents (_hInFile h) ""
             putFileContents (_hOutFile h) ""
-            return (h {_hReverseHandle = Just h'})
+            let c = Connection host port h h' (server h')
+            putConnection c
+            return h
 
 hClose :: Handle -> IO ()
 hClose h = 
   do d <- getHData "hClose" h
      putHData h (d {_hIsOpen = False})
-     maybe (return ()) hClose (_hReverseHandle h)
 
 getOpenHandles :: IO [Handle]
 getOpenHandles = 
@@ -440,7 +502,7 @@ hTell :: Handle -> IO Integer
 hTell h =
   do d <- getHData "hTell" h
      hEnsureOpen' "hTell" h d
-     return (if _hIsSeekable d then fromIntegral (_hBufPos d) else seekError "hTell" h)
+     return (if _hIsSeekable d then fromIntegral (_hOutBufPos d) else seekError "hTell" h)
 
 hFileSize :: Handle -> IO Integer
 hFileSize h
@@ -472,9 +534,9 @@ hSeek h mode pos =
      let size = fromIntegral (T.length t)
      let pos' = case mode of
                   AbsoluteSeek -> fromIntegral pos
-                  RelativeSeek -> _hBufPos d + fromIntegral pos
+                  RelativeSeek -> _hOutBufPos d + fromIntegral pos
                   SeekFromEnd  -> size - fromIntegral pos
-     let d' = if pos' < 0 then invalidArgError "hSeek" h else d {_hBufPos = pos'}
+     let d' = if pos' < 0 then invalidArgError "hSeek" h else d {_hInBufPos = pos', _hOutBufPos = pos'}
      putHData h d'
 
 hIsEOF :: Handle -> IO Bool
@@ -482,13 +544,11 @@ hIsEOF h =
   do d <- getHData "hIsEOF" h
      hEnsureOpen' "hIsEOF" h d
      t <- getFileContents "hIsEOF" (_hInFile h)
-     return (_hBufPos d >= fromIntegral (T.length t))
+     return (_hInBufPos d >= fromIntegral (T.length t))
 
 hReady :: Handle -> IO Bool
 hReady h = 
-  do d <- getHData "hWaitForInput" h
-     hEnsureOpen' "hWaitForInput" h d
-     hEnsureReadable "hWaitForInput" h d
+  do hWaitForInput h 0
      fmap not (hIsEOF h)
 
 hAvailable :: Handle -> IO Integer
@@ -497,7 +557,7 @@ hAvailable h =
      hEnsureOpen' "hAvailable" h d
      hEnsureReadable "hAvailable" h d
      t <- getFileContents "hAvailable" (_hInFile h)
-     return (max 0 (fromIntegral (T.length t) - _hBufPos d))
+     return (max 0 (fromIntegral (T.length t) - _hInBufPos d))
 
 isEOF :: IO Bool
 isEOF = hIsEOF stdin
@@ -531,7 +591,7 @@ hSetFileSize h size =
      _hSetFileSize "hSetFileSize" h d size
 
 hPrepareWrite :: String -> Handle -> HandleData -> IO ()
-hPrepareWrite s h d = _hSetFileSize s h d (_hBufPos d)
+hPrepareWrite s h d = _hSetFileSize s h d (_hOutBufPos d)
 
 hPutText :: Handle -> Text -> IO ()
 hPutText h s =
@@ -539,10 +599,12 @@ hPutText h s =
      hPrepareWrite "hPutText" h d
      let l = T.length s
      t <- getFileContents "hPutText" (_hOutFile h)
-     let t' = case T.splitAt (fromIntegral (_hBufPos d)) t of
+     let t' = case T.splitAt (fromIntegral (_hOutBufPos d)) t of
                 (t1, t2) -> T.append t1 (T.append s (T.drop l t2))
-     putHData h (d {_hBufPos = _hBufPos d + fromIntegral l})
+     putHData h (d {_hOutBufPos = _hOutBufPos d + fromIntegral l})
      putFileContents (_hOutFile h) t'
+     hooks <- getFromWorld writeHooks
+     mapM_ (\hook -> hook h s) hooks
 
 hPutStr :: Handle -> String -> IO ()
 hPutStr h s = hPutText h (T.pack s)
@@ -556,6 +618,9 @@ hPutChar h c = hPutText h (T.singleton c)
 hPrint :: Show a => Handle -> a -> IO ()
 hPrint h x = hPutStrLn h (show x)
 
+print :: Show a => a -> IO ()
+print = hPrint stdout
+
 putStr :: String -> IO ()
 putStr = hPutStr stdout
 
@@ -568,58 +633,60 @@ putChar = hPutChar stdout
 
 hEnsureReadable :: String -> Handle -> HandleData -> IO ()
 hEnsureReadable s h d
+  | not (_hIsOpen d) = fail (show h ++ ": " ++ s ++ ": illegal operation (handle is closed)")
   | allowsReading (_hGetMode d) = return ()
   | otherwise = fail (show h ++ ": " ++ s ++ ": illegal operation (handle is not open for reading)")
 
 _hGetText :: Handle -> Integer -> IO Text
 _hGetText h s =
   do d <- getHData "hGetText" h
-     hEnsureOpen' "hGetText" h d
      hEnsureReadable "hGetText" h d
      t <- getFileContents "hGetText" (_hInFile h)
-     if _hBufPos d + fromIntegral s > fromIntegral (T.length t) then
+     if _hInBufPos d + fromIntegral s > fromIntegral (T.length t) then
        fail (show h ++ ": hGetText: end of file")
      else do
-       let t' = T.take (fromIntegral s) (T.drop (fromIntegral (_hBufPos d)) t)
-       putHData h (d {_hBufPos = _hBufPos d + fromIntegral s})
+       let t' = T.take (fromIntegral s) (T.drop (fromIntegral (_hInBufPos d)) t)
+       putHData h (d {_hInBufPos = _hInBufPos d + fromIntegral s})
        return t'
 
 _hLookAhead :: Handle -> IO Char
 _hLookAhead h =
   do d <- getHData "hLookAhead" h
-     hEnsureOpen' "hLookAhead" h d
      hEnsureReadable "hLookAhead" h d
      t <- getFileContents "hLookAhead" (_hInFile h)
-     if _hBufPos d >= fromIntegral (T.length t) then
+     if _hInBufPos d >= fromIntegral (T.length t) then
        fail (show h ++ ": hLookAhead: end of file")
      else
-       return (T.index t (fromIntegral (_hBufPos d)))
+       return (T.index t (fromIntegral (_hInBufPos d)))
 
 hGetChar :: Handle -> IO Char
 hGetChar h = fmap T.head (hGetText h 1)
 
-_hGetContentText :: Handle -> IO Text
-_hGetContentText h = 
-  do d <- getHData "hGetContexts" h
-     hEnsureOpen' "hGetContents" h d
-     hEnsureReadable "hGetContents" h d
-     t <- getFileContents "hGetContents" (_hInFile h)
-     let t' = T.drop (fromIntegral (_hBufPos d)) t
-     putHData h (d {_hBufPos = _hBufPos d + fromIntegral (T.length t')})
-     return t'
+hGetContentText :: Handle -> IO Text
+hGetContentText h =
+    do res <- wrapBlockingOp' "hGetContexts" op h
+       case res of
+         Nothing -> return T.empty
+         Just t -> fmap (T.append t) (hGetContentText h)
+  where op h =
+          do d <- getHData "hGetContexts" h
+             hEnsureReadable "hGetContents" h d
+             t <- getFileContents "hGetContents" (_hInFile h)
+             let t' = T.drop (fromIntegral (_hInBufPos d)) t
+             putHData h (d {_hInBufPos = _hInBufPos d + fromIntegral (T.length t')})
+             return t'
 
 _hGetLineText :: Handle -> IO Text
 _hGetLineText h =
   do d <- getHData "hGetLine" h
-     hEnsureOpen' "hGetLine" h d
      hEnsureReadable "hGetLine" h d
      t <- getFileContents "hGetLine" (_hInFile h)
-     if _hBufPos d >= fromIntegral (T.length t) then
+     if _hInBufPos d >= fromIntegral (T.length t) then
        fail (show h ++ ": hGetLine: end of file")
      else do
-       let (t1, t2) = T.span (/= '\n') (T.drop (fromIntegral (_hBufPos d)) t)
+       let (t1, t2) = T.span (/= '\n') (T.drop (fromIntegral (_hInBufPos d)) t)
        let s = fromIntegral (T.length t1) + (if T.isPrefixOf "\n" t2 then 1 else 0)
-       putHData h (d {_hBufPos = _hBufPos d + s})
+       putHData h (d {_hInBufPos = _hInBufPos d + s})
        return t1
 
 hGetLine :: Handle -> IO String
@@ -683,25 +750,42 @@ _hIsNetworkHandle h = case _hInFile h of {NetworkSocket _ _ In -> True; _ -> Fal
 _hCanBlock :: Handle -> Bool
 _hCanBlock h = h == stdin || _hIsNetworkHandle h
 
-wrapBlockingOp :: String -> (Handle -> IO a) -> Handle -> IO a
-wrapBlockingOp s op h
-  | h == stdin =
-      do hEnsureOpen s h
-         eof <- isEOF
-         if not eof then op h else do
-           runUser
-           eof <- isEOF
-           if not eof then op h else fail (show stdin ++ ": " ++ s ++ ": user input expected, but user does not respond)")
+wrapBlockingOp' :: String -> (Handle -> IO a) -> Handle -> IO (Maybe a)
+wrapBlockingOp' s op h
+  | h == stdin || h == stdout =
+      do getHData s h >>= hEnsureReadable s h -- make sure this is not the user trying to getLine or something like that
+         hEnsureOpen s h
+         eof <- hIsEOF h
+         if not eof then fmap Just (op h) else do
+           if h == stdin then runUser else wait
+           eof <- hIsEOF h
+           if eof then return Nothing else fmap Just (op h)
   | _hIsNetworkHandle h =
       do hEnsureOpen s h
          eof <- hIsEOF h
          let host = case _hInFile h of NetworkSocket _ host _ -> host
-         if not eof then op h else do
-           runServer host (reverseHandle h)
+         if not eof then fmap Just (op h) else do
+           c <- getConnection h
+           case c of
+             Nothing -> fail (show h ++ ": " ++ s ++ ": cannot read from network socket (remote host closed connection)")
+             Just c  -> runServer c
            eof <- hIsEOF h
-           if not eof then op h else fail (show h ++ ": " ++ s ++ ": response from server " ++ host ++ " expected, but server does not respond)")
-  | otherwise = op h
+           if eof then return Nothing else fmap Just (op h)
+  | otherwise = fmap Just (op h)
 
+wrapBlockingOp :: String -> (Handle -> IO a) -> Handle -> IO a
+wrapBlockingOp s op h = wrapBlockingOp' s op h >>= maybe (fail (show h ++ ": " ++ s ++ ": " ++ msg)) return
+  where msg = if h == stdin then 
+                "user input expected, but user does not respond"
+              else if h == stdout then
+                "deadlock (IO thread expects user input, user expects IO output)"
+              else case _hInFile h of
+                NetworkSocket _ host _ -> "response from server " ++ host ++ " expected, but server does not respond"
+                _ -> "the impossible happened"
+
+hWaitForInput :: Handle -> Int -> IO Bool
+hWaitForInput h _ = getHData "hWaitForInput" h >>= hEnsureReadable "hWaitForInput" h >> 
+  fmap (maybe False (const True)) (wrapBlockingOp' "hWaitForInput" (const (return ())) h)
 
 getText :: Integer -> IO Text
 getText = hGetText stdin
@@ -732,17 +816,7 @@ readLn :: Read a => IO a
 readLn = getLine >>= readIO
 
 getContentText :: IO Text
-getContentText =
-  do t <- _hGetContentText stdin
-     runUser
-     eof <- isEOF
-     t' <- if eof then return t else fmap (T.append t) getContentText
-     hClose stdin
-     return t'
-
-hGetContentText :: Handle -> IO Text
-hGetContentText (Handle _ _ (SpecialFile StdIn) _ _) = getContentText
-hGetContentText h = do {t <- _hGetContentText h; hClose h; return t}
+getContentText = hGetContentText stdin
 
 hGetContents :: Handle -> IO String
 hGetContents h = fmap T.unpack (hGetContentText h)
@@ -761,4 +835,55 @@ interact f =
 
 hFlush :: Handle -> IO ()
 hFlush _ = return ()
+
+
+
+newtype ConsoleHook = ConsoleHook (MVar [(SpecialFile, Text)])
+
+hookConsole :: IO ConsoleHook
+hookConsole = 
+    do v <- newMVar []
+       registerWriteHook (hook v)
+       return (ConsoleHook v)
+  where hook v h t = case _hOutFile h of
+                       SpecialFile special -> modifyMVar_ v (\xs -> return ((special, t) : xs))
+                       _ -> return ()
+
+readConsoleHook :: ConsoleHook -> IO [(SpecialFile, Text)]
+readConsoleHook (ConsoleHook v) = fmap reverse (readMVar v)
+
+showConsoleHook :: ConsoleHook -> IO String
+showConsoleHook h = fmap (T.unpack . T.intercalate nl . format) (readConsoleHook h)
+  where format = map (\xs -> formatLine (fst (head xs)) (T.lines (T.concat (map snd xs)))) . groupBy ((==) `on` fst)
+        formatLine t xs = T.intercalate nl (map (T.append (prefix t)) xs)
+        nl = T.pack "\n"
+        prefix StdIn  = "> "
+        prefix StdOut = ""
+        prefix StdErr = "ERR: "
+
+newtype HandleHook = HandleHook (MVar [(Direction, Text)])
+
+hookHandle :: Handle -> IO HandleHook
+hookHandle h =
+    do v <- newMVar []
+       registerWriteHook (hook v)
+       return (HandleHook v)
+  where hook v h' t = if _hOutFile h' == _hOutFile h then
+                        modifyMVar_ v (\xs -> return ((Out, t) : xs))
+                      else if _hOutFile h' == _hInFile h then
+                        modifyMVar_ v (\xs -> return ((In, t) : xs))
+                      else
+                        return ()
+
+readHandleHook :: HandleHook -> IO [(Direction, Text)]
+readHandleHook (HandleHook v) = fmap reverse (readMVar v)
+
+showHandleHook :: HandleHook -> IO String
+showHandleHook h = fmap (T.unpack . T.intercalate nl . format) (readHandleHook h)
+  where format = map (\xs -> formatLine (fst (head xs)) (T.lines (T.concat (map snd xs)))) . groupBy ((==) `on` fst)
+        formatLine t xs = T.intercalate nl (map (T.append (prefix t)) xs)
+        nl = T.pack "\n"
+        prefix In  = "<< "
+        prefix Out = ">> "
+
 

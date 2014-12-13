@@ -1,23 +1,8 @@
 {-# LANGUAGE Trustworthy #-}
-{-# LANGUAGE CPP, NoImplicitPrelude, BangPatterns, PackageImports #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE PackageImports #-}
 
------------------------------------------------------------------------------
--- |
--- Module      :  Prelude
--- Copyright   :  (c) The University of Glasgow 2001
--- License     :  BSD-style (see the file libraries/base/LICENSE)
--- 
--- Maintainer  :  libraries@haskell.org
--- Stability   :  stable
--- Portability :  portable
---
--- The Prelude: a standard module. The Prelude is imported by default
--- into all Haskell modules unless either there is an explicit import
--- statement for it, or the NoImplicitPrelude extension is enabled.
---
------------------------------------------------------------------------------
-
-module System.Mock.IO.Prelude (
+module Prelude (
 
     -- * Standard types, classes and related functions
 
@@ -118,11 +103,9 @@ module System.Mock.IO.Prelude (
     getChar,
     getLine, getContents, interact,
     FilePath,
-    readFile, writeFile, appendFile, readIO, readLn,
-
+    readFile, writeFile, appendFile, readIO, readLn
   ) where
 
-import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, 
+import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, print,
                               readFile, writeFile, appendFile, getContents, interact)
-import System.Mock.IO
-
+import System.Mock.IO.Internal

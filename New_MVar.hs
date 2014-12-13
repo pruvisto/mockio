@@ -1,8 +1,8 @@
-{-# LANGUAGE NoImplicitPrelude #-}
-module System.Mock.MVar (
+{-# LANGUAGE Trustworthy #-}
+
+module Control.Concurrent.MVar (
     MVar, newMVar, newEmptyMVar, isEmptyMVar, tryTakeMVar, takeMVar, tryPutMVar, tryReadMVar, 
     readMVar, putMVar, swapMVar, modifyMVar, modifyMVar_,
   ) where
-  
-import System.Mock.IO.Internal
 
+import System.Mock.IO.Internal
