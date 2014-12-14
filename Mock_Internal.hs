@@ -10,8 +10,9 @@
 {-# LANGUAGE StandaloneDeriving #-}
 module System.Mock.IO.Internal (
     IO, MVar, Handle, IOMode (..), SeekMode (..), FilePath, HandlePosn (..), Direction (In, Out), SpecialFile (..),
+    IOException (..), IOErrorType (..), ConsoleHook, HandleHook,
     RealWorld (RealWorld, handles, files, workDir, isPermitted, nextHandle),
-    newWorld, emptyWorld, setUser, addServer, removeServer, listServers, runIO, evalIO, stdin, stdout, stderr,
+    newWorld, emptyWorld, setUser, addServer, removeServer, listServers, runIO, evalIO, tryRunIO, tryEvalIO, stdin, stdout, stderr,
     newMVar, newEmptyMVar, isEmptyMVar, tryTakeMVar, takeMVar, tryPutMVar, tryReadMVar, readMVar, putMVar, swapMVar, modifyMVar, modifyMVar_,
     withFile, openFile, hClose, readFile, writeFile, appendFile, doesFileExist,
     connectTo, withSocketsDo,
@@ -23,18 +24,22 @@ module System.Mock.IO.Internal (
     putChar, putStr, putStrLn, print,
     getChar, getLine, getContents, readIO, readLn, interact,
     dumpHandle, getOpenHandles, wait,
+    ioError, ioException, userError, tryIO, catchIO,
     registerWriteHook, hookConsole, readConsoleHook, showConsoleHook, hookHandle, readHandleHook, showHandleHook
   ) where
 
 import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, print,
-                              readFile, writeFile, appendFile, getContents, interact)
+                              readFile, writeFile, appendFile, getContents, interact, userError, ioError, IOError)
 import qualified "network" Network as N
 
+import Control.Arrow
 import Control.Applicative
+import Control.Exception hiding (Deadlock, ioError, IOException, IOError)
 import Control.Monad
 import Control.Monad.Cont
 import Control.Monad.State.Strict
 import Control.Monad.Pause
+import Control.Monad.Except
 
 import Data.Function
 import qualified Data.Text.Lazy as T
@@ -47,6 +52,8 @@ import Data.List.Split
 import Data.List
 import Data.Typeable
 import Debug.Trace
+
+import Foreign.C.Types
 
 type FilePath = String
 type PortID = N.PortID
@@ -106,6 +113,7 @@ instance Show File where
 
 data Connection = Connection { connectionHost :: String, connectionPort :: PortID,
                                clientHandle :: Handle, serverHandle :: Handle, connectionServer :: ServerInstance }
+  deriving (Typeable)
 
 data Handle = Handle {_hId :: Integer, _hName :: String, _hInFile :: File, _hOutFile :: File} deriving (Typeable)
 
@@ -132,12 +140,6 @@ data HandleData = HandleData {
 _hIsFile :: Handle -> Bool
 _hIsFile h = case _hInFile h of {RegularFile _ -> True; _ -> False}
 
-seekError :: String -> Handle -> a
-seekError s h = error (show h ++ ": " ++ s ++ ": illegal operation (handle is not seekable)")
-
-invalidArgError :: String -> Handle -> a
-invalidArgError s h = error (show h ++ ": " ++ s ++ ": illegal operation (Invalid argument)")
-
 type User = IO ()
 type Server = Handle -> ServerInstance
 type ServerInstance = IO ()
@@ -145,7 +147,72 @@ type ServerInstance = IO ()
 data MVar a = MVar Integer deriving (Eq, Ord, Typeable)
 data MValue = MEmpty | forall a. Typeable a => MValue a deriving (Typeable)
 
-newtype IO a = IO { unwrapIO :: PauseT (State RealWorld) a } deriving (Functor, Applicative, Monad)
+data IOErrorType = AlreadyExists | NoSuchThing | ResourceBusy | ResourceExhausted | EOF | IllegalOperation
+  | PermissionDenied | UserError | UnsatisfiedConstraints | SystemError | ProtocolError | OtherError | InvalidArgument
+  | InappropriateType | HardwareFault | UnsupportedOperation | TimeExpired | ResourceVanished | Interrupted
+  | CrossingWorlds | Deadlock
+  deriving (Eq, Typeable)
+  
+instance Show IOErrorType where
+  showsPrec _ e =
+    showString $
+    case e of
+      AlreadyExists     -> "already exists"
+      NoSuchThing       -> "does not exist"
+      ResourceBusy      -> "resource busy"
+      ResourceExhausted -> "resource exhausted"
+      EOF               -> "end of file"
+      IllegalOperation  -> "illegal operation"
+      PermissionDenied  -> "permission denied"
+      UserError         -> "user error"
+      HardwareFault     -> "hardware fault"
+      InappropriateType -> "inappropriate type"
+      Interrupted       -> "interrupted"
+      InvalidArgument   -> "invalid argument"
+      OtherError        -> "failed"
+      ProtocolError     -> "protocol error"
+      ResourceVanished  -> "resource vanished"
+      SystemError       -> "system error"
+      TimeExpired       -> "timeout"
+      UnsatisfiedConstraints -> "unsatisified constraints"
+      UnsupportedOperation -> "unsupported operation"
+      CrossingWorlds -> "not of this world"
+      Deadlock -> "deadlock"
+
+data IOException = IOError {
+   ioe_handle   :: Maybe Handle,   -- the handle used by the action flagging the error.
+   ioe_type     :: IOErrorType,    -- what it was.
+   ioe_location :: String,         -- location.
+   ioe_description :: String,      -- error type specific information.
+   ioe_errno    :: Maybe CInt,
+   ioe_filename :: Maybe FilePath  -- filename the error is related to.
+} deriving (Typeable)
+
+instance Show IOException where
+    showsPrec p (IOError hdl iot loc s _ fn) =
+      (case fn of
+         Nothing -> case hdl of
+                        Nothing -> id
+                        Just h  -> showsPrec p h . showString ": "
+         Just name -> showString name . showString ": ") .
+      (case loc of
+         "" -> id
+         _  -> showString loc . showString ": ") .
+      showsPrec p iot .
+      (case s of
+         "" -> id
+         _  -> showString " (" . showString s . showString ")")
+
+instance Exception IOException
+
+type IOError = IOException
+
+
+
+{- IO definition -}
+
+newtype IO a = IO { unwrapIO :: PauseT (ExceptT IOException (State RealWorld)) a } 
+  deriving (Functor, Applicative, Monad, MonadError IOException, Typeable)
 
 data RealWorld = forall u. RealWorld {
   workDir :: FilePath,
@@ -159,7 +226,39 @@ data RealWorld = forall u. RealWorld {
   mvars :: Map Integer MValue,
   nextMVar :: Integer,
   writeHooks :: [Handle -> Text -> IO ()]
-}
+} deriving (Typeable)
+
+
+{- IO errors -}
+
+simpleIOError :: IOErrorType -> String -> String -> IO a
+simpleIOError iot loc descr = throwError (IOError Nothing iot loc descr Nothing Nothing)
+
+hIOError :: Handle -> IOErrorType -> String -> String -> IO a
+hIOError h iot loc descr = throwError (IOError (Just h) iot loc descr Nothing Nothing)
+
+fileIOError :: FilePath -> IOErrorType -> String -> String -> IO a
+fileIOError path iot loc descr = throwError (IOError Nothing iot loc descr Nothing (Just path))
+
+ioError :: IOError -> IO a
+ioError = ioException
+
+ioException :: IOException -> IO a
+ioException = throwError
+
+throwIO :: Exception e => e -> IO a
+throwIO = throw
+
+userError :: String -> IOError
+userError s = IOError Nothing UserError "" s Nothing Nothing
+
+catchIO :: IO a -> (IOException -> IO a) -> IO a
+catchIO = catchError
+
+tryIO :: IO a -> IO (Either IOException a)
+tryIO io = catchIO (fmap Right io) (return . Left)
+
+{- World manipulation -}
 
 getWorld :: IO RealWorld
 getWorld = IO (lift get)
@@ -179,7 +278,7 @@ putConnectionServer h s = updateWorld (\w -> w {connections = f (connections w)}
 
 -- Give control back to the caller
 wait :: IO ()
-wait = IO yield
+wait = IO pause
 
 nop :: IO ()
 nop = return ()
@@ -188,11 +287,17 @@ nop = return ()
 runIOUntilSuspend :: IO () -> (IO () -> IO ()) -> IO ()
 runIOUntilSuspend (IO c) wr = IO (lift (stepPause c)) >>= either (wr . IO) (const (wr nop))
 
-evalIO :: IO a -> RealWorld -> a
-evalIO io w = fst (runIO io w)
+tryEvalIO :: IO a -> RealWorld -> Either IOException a
+tryEvalIO io w = fst (tryRunIO io w)
+
+tryRunIO :: IO a -> RealWorld -> (Either IOException a, RealWorld)
+tryRunIO (IO io) w = runState (runExceptT (runPauseT io)) w
 
 runIO :: IO a -> RealWorld -> (a, RealWorld)
-runIO (IO io) w = runState (runPause io) w
+runIO io w = first (either (\e -> error ("Mock IO Exception: " ++ show e)) id) (tryRunIO io w)
+
+evalIO :: IO a -> RealWorld -> a
+evalIO io w = fst (runIO io w)
 
 
 {- Mutable variables -}
@@ -215,14 +320,14 @@ tryTakeMVar :: Typeable a => MVar a -> IO (Maybe a)
 tryTakeMVar (MVar x) = 
   do y <- fmap (M.lookup x . mvars) getWorld
      case y of
-       Nothing -> fail ("Invalid MVar: " ++ show x)
+       Nothing -> simpleIOError CrossingWorlds "tryTakeMVar" ("Invalid MVar: " ++ show x)
        Just MEmpty -> return Nothing
        Just (MValue y) -> case cast y of
-                            Nothing -> fail ("Invalid MVar: " ++ show x)
+                            Nothing -> simpleIOError CrossingWorlds "tryTakeMVar" ("Invalid MVar: " ++ show x)
                             Just y  -> return (Just y)
 
 takeMVar :: Typeable a => MVar a -> IO a
-takeMVar (MVar x) = tryTakeMVar (MVar x) >>= maybe (fail ("Empty MVar: " ++ show x)) return
+takeMVar (MVar x) = tryTakeMVar (MVar x) >>= maybe (simpleIOError Deadlock "takeMVar" ("Empty MVar: " ++ show x)) return
 
 isEmptyMVar :: Typeable a => MVar a -> IO Bool
 isEmptyMVar x = fmap (maybe True (const False)) (tryTakeMVar x)
@@ -240,10 +345,10 @@ modifyMVar :: Typeable a => MVar a -> (a -> IO (a, b)) -> IO b
 modifyMVar (MVar x) f =
   do w <- getWorld
      case M.lookup x (mvars w) of
-       Nothing -> fail ("Empty MVar: " ++ show x)
-       Just MEmpty -> fail ("Invalid MVar: " ++ show x)
+       Nothing -> simpleIOError Deadlock "modifyMVar" ("Empty MVar: " ++ show x)
+       Just MEmpty -> simpleIOError CrossingWorlds "modifyTakeMVar" ("Invalid MVar: " ++ show x)
        Just (MValue y) -> case cast y of
-                             Nothing -> fail ("Empty MVar: " ++ show x)
+                             Nothing -> simpleIOError Deadlock "modifyMVar" ("Empty MVar: " ++ show x)
                              Just y -> do (z,r) <- f y
                                           putWorld (w {mvars = M.insert x (MValue z) (mvars w)})
                                           return r
@@ -268,8 +373,8 @@ registerWriteHook h = updateWorld (\w -> w {writeHooks = h : writeHooks w})
 
 {- The User -}
 
-setUser :: User -> RealWorld -> RealWorld
-setUser u w = w {user = u}
+setUser :: User -> IO ()
+setUser = putUser
 
 putUser :: User -> IO ()
 putUser u = updateWorld (\w -> w {user = u})
@@ -294,11 +399,11 @@ runUser =
 getServer :: String -> IO (Maybe Server)
 getServer s = fmap (M.lookup s . servers) getWorld
 
-addServer :: HostName -> PortID -> (Handle -> IO ()) -> RealWorld -> RealWorld
-addServer host port server w = w {servers = M.insert (showConnectionInfo host port) server (servers w)}
+addServer :: HostName -> PortID -> (Handle -> IO ()) -> IO ()
+addServer host port server = updateWorld (\w -> w {servers = M.insert (showConnectionInfo host port) server (servers w)})
 
-removeServer :: HostName -> PortID -> RealWorld -> RealWorld
-removeServer host port w = w {servers = M.delete (showConnectionInfo host port) (servers w)}
+removeServer :: HostName -> PortID -> IO ()
+removeServer host port = updateWorld (\w -> w {servers = M.delete (showConnectionInfo host port) (servers w)})
 
 listServers :: IO [String]
 listServers = fmap (map fst . M.toList . servers) getWorld
@@ -352,7 +457,7 @@ emptyWorld = newWorld "/" [] (\_ _ -> True)
 getHData :: String -> Handle -> IO HandleData
 getHData s h = do d <- fmap (M.lookup h . handles) getWorld
                   case d of
-                    Nothing -> error (show h ++ ": " ++ s ++ ": invalid handle")
+                    Nothing -> hIOError h CrossingWorlds s "Invalid handle"
                     Just d  -> return d
 
 putHData :: Handle -> HandleData -> IO ()
@@ -384,7 +489,9 @@ getFileContents :: String -> File -> IO Text
 getFileContents s f = 
   do w <- getWorld
      case M.lookup f (files w) of
-       Nothing -> fail (show f ++ ": " ++ s ++ ": does not exist (No such file or directory)")
+       Nothing -> case f of 
+                    RegularFile p -> fileIOError p NoSuchThing s "No such file or directory"
+                    _ -> simpleIOError NoSuchThing s "No such file or directory"
        Just t  -> return t
 
 putFileContents :: File -> Text -> IO ()
@@ -397,7 +504,7 @@ fileSize f = fmap (fromIntegral . T.length) (getFileContents "fileSize" f)
 
                   
 type HandlePosition = Integer
-data HandlePosn = HandlePosn Handle HandlePosition
+data HandlePosn = HandlePosn Handle HandlePosition deriving (Typeable)
 
 instance Eq HandlePosn where
     (HandlePosn h1 p1) == (HandlePosn h2 p2) = p1==p2 && h1==h2
@@ -408,7 +515,7 @@ instance Show HandlePosn where
 
 hEnsureOpen' :: String -> Handle -> HandleData -> IO ()
 hEnsureOpen' s h d = 
-  if _hIsOpen d then return () else fail (show h ++ ": " ++ s ++ ": illegal operation (handle is closed)")
+  if _hIsOpen d then return () else hIOError h IllegalOperation s "handle is closed"
 
 hEnsureOpen :: String -> Handle -> IO ()
 hEnsureOpen s h = getHData s h >>= hEnsureOpen' s h
@@ -446,12 +553,12 @@ openFile path mode =
      p <- mkPath path
      f <- mkFile path
      if not (isPermitted w p mode) then
-       fail (show f ++ ": " ++ "openFile: permission denied (Permission denied)")
+       fileIOError path PermissionDenied "openFile" "Permission denied"
      else do
        let ex = fileExists w f
        when (not ex) $
          if mode == ReadMode then 
-           fail (show f ++ ": openFile: does not exist (No such file or directory)")
+           fileIOError path NoSuchThing "openFile" "No such file or directory"
          else
            writeFile p ""
        pos <- if mode == AppendMode then fmap (fromIntegral . T.length) (getFileContents "openFile" f) else return 0
@@ -471,7 +578,7 @@ connectTo host port =
      w <- getWorld
      server <- getServer name
      case server of
-       Nothing -> fail "connect: does not exist (Connection refused)"
+       Nothing -> simpleIOError NoSuchThing "connect" "Connection refused"
        Just server  -> 
          do h <- mkHandle name (\id -> NetworkSocket id name In) (\id -> NetworkSocket id name Out) ReadWriteMode False 0
             h' <- mkHandle (name ++ " (server)") (const (_hOutFile h)) (const (_hInFile h)) ReadWriteMode False 0
@@ -502,7 +609,10 @@ hTell :: Handle -> IO Integer
 hTell h =
   do d <- getHData "hTell" h
      hEnsureOpen' "hTell" h d
-     return (if _hIsSeekable d then fromIntegral (_hOutBufPos d) else seekError "hTell" h)
+     if _hIsSeekable d then 
+       return (fromIntegral (_hOutBufPos d)) 
+     else
+       hIOError h IllegalOperation "hTell" "handle is not seekable"
 
 hFileSize :: Handle -> IO Integer
 hFileSize h
@@ -511,7 +621,7 @@ hFileSize h
          hEnsureOpen' "hFileSize" h d
          t <- getFileContents "hFileSize" (_hInFile h)
          return (fromIntegral (T.length t))
-  | otherwise = fail (show h ++ ": hFileSize: inappropriate type (not a regular file)")
+  | otherwise = hIOError h InappropriateType "hFileSize" "not a regular file"
 
 hGetBuffering :: Handle -> IO BufferMode
 hGetBuffering h = fmap _hBufferMode (getHData "hGetBuffering" h)
@@ -529,15 +639,15 @@ hSeek :: Handle -> SeekMode -> Integer -> IO ()
 hSeek h mode pos =
   do d <- getHData "hSeek" h
      hEnsureOpen' "hSeek" h d
-     if not (_hIsSeekable d) then seekError "hSeek" h else return ()
+     when (not (_hIsSeekable d)) (hIOError h IllegalOperation "hSeek" "handle is not seekable")
      t <- getFileContents "hSeek" (_hInFile h)
      let size = fromIntegral (T.length t)
      let pos' = case mode of
                   AbsoluteSeek -> fromIntegral pos
                   RelativeSeek -> _hOutBufPos d + fromIntegral pos
                   SeekFromEnd  -> size - fromIntegral pos
-     let d' = if pos' < 0 then invalidArgError "hSeek" h else d {_hInBufPos = pos', _hOutBufPos = pos'}
-     putHData h d'
+     when (pos' < 0) (hIOError h InvalidArgument "hSeek" "Invalid argument")
+     putHData h (d {_hInBufPos = pos', _hOutBufPos = pos'})
 
 hIsEOF :: Handle -> IO Bool
 hIsEOF h =
@@ -577,7 +687,7 @@ _hSetFileSize :: String -> Handle -> HandleData -> Integer -> IO ()
 _hSetFileSize s h d size =
   do hEnsureOpen' s h d
      if allowsWriting (_hGetMode d) then return ()
-        else fail (show h ++ ": " ++ s ++ ": illegal operation (handle is not open for writing)")
+        else hIOError h IllegalOperation s "handle is not open for writing"
      t <- getFileContents s (_hOutFile h)
      let diff = fromIntegral size - fromIntegral (T.length t)
      case compare diff 0 of
@@ -633,9 +743,9 @@ putChar = hPutChar stdout
 
 hEnsureReadable :: String -> Handle -> HandleData -> IO ()
 hEnsureReadable s h d
-  | not (_hIsOpen d) = fail (show h ++ ": " ++ s ++ ": illegal operation (handle is closed)")
+  | not (_hIsOpen d) = hIOError h IllegalOperation s "handle is closed"
   | allowsReading (_hGetMode d) = return ()
-  | otherwise = fail (show h ++ ": " ++ s ++ ": illegal operation (handle is not open for reading)")
+  | otherwise = hIOError h IllegalOperation s "handle is not open for reading"
 
 _hGetText :: Handle -> Integer -> IO Text
 _hGetText h s =
@@ -643,7 +753,7 @@ _hGetText h s =
      hEnsureReadable "hGetText" h d
      t <- getFileContents "hGetText" (_hInFile h)
      if _hInBufPos d + fromIntegral s > fromIntegral (T.length t) then
-       fail (show h ++ ": hGetText: end of file")
+       hIOError h EOF "hGetText" ""
      else do
        let t' = T.take (fromIntegral s) (T.drop (fromIntegral (_hInBufPos d)) t)
        putHData h (d {_hInBufPos = _hInBufPos d + fromIntegral s})
@@ -655,7 +765,7 @@ _hLookAhead h =
      hEnsureReadable "hLookAhead" h d
      t <- getFileContents "hLookAhead" (_hInFile h)
      if _hInBufPos d >= fromIntegral (T.length t) then
-       fail (show h ++ ": hLookAhead: end of file")
+       hIOError h EOF "hLookAhead" ""
      else
        return (T.index t (fromIntegral (_hInBufPos d)))
 
@@ -682,7 +792,7 @@ _hGetLineText h =
      hEnsureReadable "hGetLine" h d
      t <- getFileContents "hGetLine" (_hInFile h)
      if _hInBufPos d >= fromIntegral (T.length t) then
-       fail (show h ++ ": hGetLine: end of file")
+       hIOError h EOF "hGetLine" ""
      else do
        let (t1, t2) = T.span (/= '\n') (T.drop (fromIntegral (_hInBufPos d)) t)
        let s = fromIntegral (T.length t1) + (if T.isPrefixOf "\n" t2 then 1 else 0)
@@ -698,7 +808,7 @@ readFileText path =
      p <- mkPath path
      f <- mkFile path
      if not (isPermitted w p ReadMode) then
-       fail (path ++ ": " ++ "openFile: permission denied (Permission denied)")
+       fileIOError path PermissionDenied "openFile" "Permission denied"
      else
        mkFile path >>= getFileContents "openFile"
 
@@ -711,7 +821,7 @@ writeFileText path t =
      p <- mkPath path
      f <- mkFile path
      if not (isPermitted w p WriteMode) then
-       fail (path ++ ": " ++ "openFile: permission denied (Permission denied)")
+       fileIOError path PermissionDenied "openFile" "Permission denied"
      else do
        f <- mkFile path
        putFileContents f t
@@ -725,7 +835,7 @@ appendFileText path t =
      p <- mkPath path
      f <- mkFile path
      if not (isPermitted w p AppendMode) then
-       fail (path ++ ": " ++ "openFile: permission denied (Permission denied)")
+       fileIOError path PermissionDenied "openFile" "Permission denied"
      else do
        f <- mkFile path
        w <- getWorld
@@ -741,8 +851,8 @@ readIO s        =  case (do { (x,t) <- reads s ;
                               ("","") <- lex t ;
                               return x }) of
                         [x]    -> return x
-                        []     -> fail "IO.readIO: no parse"
-                        _      -> fail "IO.readIO: ambiguous parse"
+                        []     -> ioError (userError "Prelude.readIO: no parse")
+                        _      -> ioError (userError "Prelude.readIO: ambiguous parse")
 
 _hIsNetworkHandle :: Handle -> Bool
 _hIsNetworkHandle h = case _hInFile h of {NetworkSocket _ _ In -> True; _ -> False}
@@ -767,18 +877,18 @@ wrapBlockingOp' s op h
          if not eof then fmap Just (op h) else do
            c <- getConnection h
            case c of
-             Nothing -> fail (show h ++ ": " ++ s ++ ": cannot read from network socket (remote host closed connection)")
+             Nothing -> hIOError h ResourceVanished s "broken pipe"
              Just c  -> runServer c
            eof <- hIsEOF h
            if eof then return Nothing else fmap Just (op h)
   | otherwise = fmap Just (op h)
 
 wrapBlockingOp :: String -> (Handle -> IO a) -> Handle -> IO a
-wrapBlockingOp s op h = wrapBlockingOp' s op h >>= maybe (fail (show h ++ ": " ++ s ++ ": " ++ msg)) return
+wrapBlockingOp s op h = wrapBlockingOp' s op h >>= maybe (hIOError h Deadlock s msg) return
   where msg = if h == stdin then 
                 "user input expected, but user does not respond"
               else if h == stdout then
-                "deadlock (IO thread expects user input, user expects IO output)"
+                "IO thread expects user input, user expects IO output"
               else case _hInFile h of
                 NetworkSocket _ host _ -> "response from server " ++ host ++ " expected, but server does not respond"
                 _ -> "the impossible happened"
@@ -838,7 +948,7 @@ hFlush _ = return ()
 
 
 
-newtype ConsoleHook = ConsoleHook (MVar [(SpecialFile, Text)])
+newtype ConsoleHook = ConsoleHook (MVar [(SpecialFile, Text)]) deriving (Typeable)
 
 hookConsole :: IO ConsoleHook
 hookConsole = 
@@ -861,7 +971,7 @@ showConsoleHook h = fmap (T.unpack . T.intercalate nl . format) (readConsoleHook
         prefix StdOut = ""
         prefix StdErr = "ERR: "
 
-newtype HandleHook = HandleHook (MVar [(Direction, Text)])
+newtype HandleHook = HandleHook (MVar [(Direction, Text)]) deriving (Typeable)
 
 hookHandle :: Handle -> IO HandleHook
 hookHandle h =

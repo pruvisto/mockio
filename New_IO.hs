@@ -3,6 +3,7 @@
 
 module System.IO (
     IO, Handle, IOMode, SeekMode, FilePath, HandlePosn,
+    IOException (..), IOErrorType (..),
     stdin, stdout, stderr,
     withFile, openFile, hClose, readFile, writeFile, appendFile, doesFileExist,
     hFileSize, hSetFileSize, hIsEOF, isEOF, hReady, hAvailable, hWaitForInput,
@@ -11,6 +12,7 @@ module System.IO (
     hGetChar, hGetLine, hLookAhead, hGetContents, 
     hPutChar, hPutStr, hPutStrLn, hPrint,
     putChar, putStr, putStrLn, print,
+    ioError, ioException, userError,
     getChar, getLine, getContents, readIO, readLn, interact
   ) where
   
