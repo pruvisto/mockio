@@ -13,7 +13,9 @@ module System.IO (
     hPutChar, hPutStr, hPutStrLn, hPrint,
     putChar, putStr, putStrLn, print,
     ioError, ioException, userError,
-    getChar, getLine, getContents, readIO, readLn, interact
+    getChar, getLine, getContents, readIO, readLn, interact,
+    isAlreadyExistsError, isDoesNotExistError, isAlreadyInUseError, isFullError, isEOFError, isIllegalOperation, 
+    isPermissionError, isUserError, ioeGetErrorType, ioeGetLocation, ioeGetErrorString, ioeGetHandle, ioeGetFileName
   ) where
   
 import System.Mock.IO.Internal

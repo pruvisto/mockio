@@ -25,7 +25,9 @@ module System.Mock.IO.Internal (
     getChar, getLine, getContents, readIO, readLn, interact,
     dumpHandle, getOpenHandles, wait,
     ioError, ioException, userError, tryIO, catchIO,
-    registerWriteHook, hookConsole, readConsoleHook, showConsoleHook, hookHandle, readHandleHook, showHandleHook
+    registerWriteHook, hookConsole, readConsoleHook, showConsoleHook, hookHandle, readHandleHook, showHandleHook,
+    isAlreadyExistsError, isDoesNotExistError, isAlreadyInUseError, isFullError, isEOFError, isIllegalOperation, 
+    isPermissionError, isUserError, ioeGetErrorType, ioeGetLocation, ioeGetErrorString, ioeGetHandle, ioeGetFileName
   ) where
 
 import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, print,
@@ -261,6 +263,47 @@ catchIO = catchError
 
 tryIO :: IO a -> IO (Either IOException a)
 tryIO io = catchIO (fmap Right io) (return . Left)
+
+ioeGetErrorType :: IOError -> IOErrorType
+ioeGetErrorType = ioe_type
+
+ioeGetErrorString :: IOError -> String
+ioeGetErrorString ioe
+   | isUserError ioe = ioe_description ioe
+   | otherwise       = show (ioe_type ioe)
+
+ioeGetLocation :: IOError -> String
+ioeGetLocation ioe = ioe_location ioe
+
+ioeGetHandle :: IOError -> Maybe Handle
+ioeGetHandle ioe = ioe_handle ioe
+
+ioeGetFileName :: IOError -> Maybe FilePath
+ioeGetFileName ioe = ioe_filename ioe
+
+isAlreadyExistsError :: IOError -> Bool
+isAlreadyExistsError = (== AlreadyExists) . ioeGetErrorType
+
+isDoesNotExistError :: IOError -> Bool
+isDoesNotExistError  = (== NoSuchThing) . ioeGetErrorType
+
+isAlreadyInUseError :: IOError -> Bool
+isAlreadyInUseError  = (== ResourceBusy) . ioeGetErrorType
+
+isFullError         :: IOError -> Bool
+isFullError          = (== ResourceExhausted) . ioeGetErrorType
+
+isEOFError          :: IOError -> Bool
+isEOFError           = (== EOF) . ioeGetErrorType
+
+isIllegalOperation  :: IOError -> Bool
+isIllegalOperation   = (== IllegalOperation) . ioeGetErrorType
+
+isPermissionError   :: IOError -> Bool
+isPermissionError    = (== PermissionDenied) . ioeGetErrorType
+
+isUserError         :: IOError -> Bool
+isUserError          = (== UserError) . ioeGetErrorType
 
 {- World manipulation -}
 
