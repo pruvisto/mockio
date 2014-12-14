@@ -212,7 +212,7 @@ type IOError = IOException
 {- IO definition -}
 
 newtype IO a = IO { unwrapIO :: PauseT (ExceptT IOException (State RealWorld)) a } 
-  deriving (Functor, Applicative, Monad, MonadError IOException, Typeable)
+  deriving (Functor, Applicative, MonadError IOException, Typeable)
 
 data RealWorld = forall u. RealWorld {
   workDir :: FilePath,
@@ -228,6 +228,10 @@ data RealWorld = forall u. RealWorld {
   writeHooks :: [Handle -> Text -> IO ()]
 } deriving (Typeable)
 
+instance Monad IO where
+  return = IO . return
+  IO x >>= f = IO (x >>= (\x -> case f x of IO y -> y))
+  fail s = ioError (userError s)
 
 {- IO errors -}
 
