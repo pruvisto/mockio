@@ -7,7 +7,7 @@ module System.Mock.IO.RealWorld (
     newWorld, emptyWorld, setUser, addServer, removeServer, listServers, runIO, evalIO, tryRunIO, tryEvalIO,
     dumpHandle, getOpenHandles, wait,
     registerWriteHook, hookConsole, readConsoleHook, showConsoleHook, hookHandle, readHandleHook, showHandleHook,
-    tryIO, catchIO
+    tryIO, catchIO, setRandomSeed
   ) where
 
 import System.Mock.IO.Internal

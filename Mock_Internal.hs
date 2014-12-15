@@ -27,12 +27,17 @@ module System.Mock.IO.Internal (
     ioError, ioException, userError, tryIO, catchIO,
     registerWriteHook, hookConsole, readConsoleHook, showConsoleHook, hookHandle, readHandleHook, showHandleHook,
     isAlreadyExistsError, isDoesNotExistError, isAlreadyInUseError, isFullError, isEOFError, isIllegalOperation, 
-    isPermissionError, isUserError, ioeGetErrorType, ioeGetLocation, ioeGetErrorString, ioeGetHandle, ioeGetFileName
+    isPermissionError, isUserError, ioeGetErrorType, ioeGetLocation, ioeGetErrorString, ioeGetHandle, ioeGetFileName,
+    
+    R.RandomGen(R.next, R.split, R.genRange), StdGen, R.mkStdGen, getStdRandom, getStdGen, setStdGen, 
+    newStdGen, setRandomSeed
+    
   ) where
 
 import "base" Prelude hiding (FilePath, IO, getLine, getChar, readIO, readLn, putStr, putStrLn, putChar, print,
                               readFile, writeFile, appendFile, getContents, interact, userError, ioError, IOError)
 import qualified "network" Network as N
+import qualified "random" System.Random as R
 
 import Control.Arrow
 import Control.Applicative
@@ -216,6 +221,8 @@ type IOError = IOException
 newtype IO a = IO { unwrapIO :: PauseT (ExceptT IOException (State RealWorld)) a } 
   deriving (Functor, Applicative, MonadError IOException, Typeable)
 
+type StdGen = R.StdGen
+
 data RealWorld = forall u. RealWorld {
   workDir :: FilePath,
   files :: Map File Text,
@@ -227,7 +234,8 @@ data RealWorld = forall u. RealWorld {
   connections :: Map Handle Connection,
   mvars :: Map Integer MValue,
   nextMVar :: Integer,
-  writeHooks :: [Handle -> Text -> IO ()]
+  writeHooks :: [Handle -> Text -> IO ()],
+  theStdGen :: StdGen
 } deriving (Typeable)
 
 instance Monad IO where
@@ -346,6 +354,29 @@ runIO io w = first (either (\e -> error ("Mock IO Exception: " ++ show e)) id) (
 evalIO :: IO a -> RealWorld -> a
 evalIO io w = fst (runIO io w)
 
+
+{- Random numbers -}
+
+setStdGen :: StdGen -> IO ()
+setStdGen sgen = updateWorld (\w -> w {theStdGen = sgen})
+
+getStdGen :: IO StdGen
+getStdGen = getFromWorld theStdGen
+
+newStdGen :: IO StdGen
+newStdGen =
+  do (g, g') <- liftM R.split getStdGen
+     setStdGen g
+     return g'
+
+getStdRandom :: (StdGen -> (a,StdGen)) -> IO a
+getStdRandom f =
+  do (x, g) <- liftM f getStdGen
+     setStdGen g
+     return x
+
+setRandomSeed :: Int -> IO ()
+setRandomSeed seed = setStdGen (R.mkStdGen seed)
 
 {- Mutable variables -}
 
@@ -495,7 +526,8 @@ newWorld workDir files permitted =
     servers = M.empty,
     connections = M.empty,
     user = defaultUser,
-    writeHooks = []
+    writeHooks = [],
+    theStdGen = R.mkStdGen 0
   }
 
 emptyWorld :: RealWorld
