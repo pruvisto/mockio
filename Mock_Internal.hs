@@ -9,11 +9,12 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE StandaloneDeriving #-}
 module System.Mock.IO.Internal (
-    IO, MVar, Handle, IOMode (..), SeekMode (..), FilePath, HandlePosn (..), Direction (In, Out), SpecialFile (..),
+    IO, MVar, IORef, Handle, IOMode (..), SeekMode (..), FilePath, HandlePosn (..), Direction (In, Out), SpecialFile (..),
     IOException (..), IOErrorType (..), ConsoleHook, HandleHook,
     RealWorld (RealWorld, handles, files, workDir, isPermitted, nextHandle),
     newWorld, emptyWorld, setUser, addServer, removeServer, listServers, runIO, evalIO, tryRunIO, tryEvalIO, stdin, stdout, stderr,
     newMVar, newEmptyMVar, isEmptyMVar, tryTakeMVar, takeMVar, tryPutMVar, tryReadMVar, readMVar, putMVar, swapMVar, modifyMVar, modifyMVar_,
+    newIORef, readIORef, writeIORef, modifyIORef, modifyIORef', atomicModifyIORef, atomicModifyIORef', atomicWriteIORef,
     withFile, openFile, hClose, readFile, writeFile, appendFile, doesFileExist,
     connectTo, withSocketsDo,
     hFileSize, hSetFileSize, hIsEOF, isEOF, hGetBuffering, hSetBuffering, hFlush,
@@ -442,6 +443,35 @@ tryPutMVar (MVar x) y =
 
 putMVar :: Typeable a => MVar a -> a -> IO ()
 putMVar x y = tryPutMVar x y >> return ()
+
+
+{- IO References -}
+
+newtype IORef a = IORef {ioRefToMVar :: MVar a} deriving (Eq, Ord, Typeable)
+
+newIORef :: Typeable a => a -> IO (IORef a)
+newIORef = fmap IORef . newMVar
+
+readIORef :: Typeable a => IORef a -> IO a
+readIORef (IORef v) = takeMVar v
+
+writeIORef :: Typeable a => IORef a -> a -> IO ()
+writeIORef (IORef v) x = putMVar v x
+
+modifyIORef :: Typeable a => IORef a -> (a -> a) -> IO ()
+modifyIORef (IORef v) f = modifyMVar_ v (return . f)
+
+modifyIORef' :: Typeable a => IORef a -> (a -> a) -> IO ()
+modifyIORef' (IORef v) f = modifyMVar_ v (\x -> let y = f x in y `seq` return y)
+
+atomicModifyIORef :: Typeable a => IORef a -> (a -> (a, b)) -> IO b
+atomicModifyIORef (IORef v) f = modifyMVar v (return . f)
+
+atomicModifyIORef' :: Typeable a => IORef a -> (a -> (a, b)) -> IO b
+atomicModifyIORef' (IORef v) f = modifyMVar v (\x -> case f x of (y, z) -> y `seq` z `seq` return (y, z))
+
+atomicWriteIORef :: Typeable a => IORef a -> a -> IO ()
+atomicWriteIORef = writeIORef
 
 
 {- Write Hooks -}
